@@ -2,7 +2,9 @@
 
 One script to forge a beautiful Debian-Hyprland-style terminal.
 
-![termcraft POC](./terminal_modifier_POC.png)
+![termcraft demo](./assets/termcraft_demo.gif)
+
+<sub>A new shell greets you with a random Pokémon beside a detailed fastfetch, under an agnosterzak prompt.</sub>
 
 ## What it does
 
