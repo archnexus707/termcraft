@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
     --no-color) NO_COLOR=1; shift ;;
     --no-spinner) NO_SPINNER=1; shift ;;
     --verbose) VERBOSE=1; shift ;;
-    --scheme) SCHEME="${2:-tokyonight}"; shift 2 ;;
+    --scheme) SCHEME="${2:-tokyonight}"; shift 2 2>/dev/null || shift ;;
     --chsh) SET_DEFAULT_SHELL=1; shift ;;
     *) shift ;;
   esac
@@ -205,8 +205,16 @@ apply_scheme_xfconf() {
   xfconf-query -c xfce4-terminal -p /color-foreground -t string -s "$FG"  --create >/dev/null 2>&1 || true
   xfconf-query -c xfce4-terminal -p /color-cursor     -t string -s "$CURSOR" --create >/dev/null 2>&1 || true
 
-  xfconf-query -c xfce4-terminal -p /color-palette -t string -a \
-    $(printf -- ' -s %q' "${PALETTE[@]}") --create >/dev/null 2>&1 || true
+  # An xfconf array needs a -t/-s pair per element; a single -t with many -s
+  # values is rejected ("N new values, but only 1 types could be determined")
+  # and the palette silently never applies.
+  local xfconf_palette=()
+  local color
+  for color in "${PALETTE[@]}"; do
+    xfconf_palette+=( -t string -s "$color" )
+  done
+  xfconf-query -c xfce4-terminal -p /color-palette -a --create \
+    "${xfconf_palette[@]}" >/dev/null 2>&1 || true
 }
 
 apply_scheme_terminalrc() {
@@ -252,7 +260,7 @@ apt_install() {
   run_cmd "Updating apt package lists" sudo apt-get update -y
 
   local required_pkgs=(
-    git curl ca-certificates unzip
+    git curl ca-certificates unzip xz-utils
     xfconf xfce4-terminal
     zsh fontconfig lsd
   )
