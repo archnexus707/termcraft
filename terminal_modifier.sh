@@ -11,10 +11,12 @@ set -Eeuo pipefail
 #     - zsh + Oh My Zsh + agnosterzak theme
 #     - zsh-autosuggestions + zsh-syntax-highlighting
 #     - lsd icon aliases
-#     - fastfetch (compact config) on shell start
+#     - fastfetch + a random Pokemon side-by-side on shell start
+#       (a detailed fastfetch config that reveals lots of PC components)
 #     - XFCE terminal palette (Tokyo Night by default) + transparency + font
 #
-#   No wallpapers, no Pokemon, no p10k, no extra MOTD.
+#   No wallpapers, no p10k, no extra MOTD. Pokemon can be turned off with
+#   --no-pokemon (or ARCHNEXUS_NO_POKEMON=1).
 # ------------------------------------------------------------
 
 # ========================= Args =========================
@@ -23,15 +25,26 @@ NO_SPINNER="${ARCHNEXUS_NO_SPINNER:-0}"
 VERBOSE="${ARCHNEXUS_VERBOSE:-0}"
 SCHEME="tokyonight"
 SET_DEFAULT_SHELL="${ARCHNEXUS_CHSH:-0}"
+SHOW_POKEMON="1"; [[ "${ARCHNEXUS_NO_POKEMON:-0}" == "1" ]] && SHOW_POKEMON="0"
+DRY_RUN="${ARCHNEXUS_DRY_RUN:-0}"
+ASSUME_YES="${ARCHNEXUS_YES:-0}"
+ACTION="install"          # install | uninstall | list-schemes | help
+BAD_FLAG=""               # set if an unknown flag was seen
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-color) NO_COLOR=1; shift ;;
-    --no-spinner) NO_SPINNER=1; shift ;;
-    --verbose) VERBOSE=1; shift ;;
-    --scheme) SCHEME="${2:-tokyonight}"; shift 2 2>/dev/null || shift ;;
-    --chsh) SET_DEFAULT_SHELL=1; shift ;;
-    *) shift ;;
+    --no-color)     NO_COLOR=1; shift ;;
+    --no-spinner)   NO_SPINNER=1; shift ;;
+    --verbose)      VERBOSE=1; shift ;;
+    --scheme)       SCHEME="${2:-tokyonight}"; shift 2 2>/dev/null || shift ;;
+    --chsh)         SET_DEFAULT_SHELL=1; shift ;;
+    --no-pokemon)   SHOW_POKEMON=0; shift ;;
+    --dry-run|-n)   DRY_RUN=1; shift ;;
+    --yes|-y)       ASSUME_YES=1; shift ;;
+    --uninstall)    ACTION="uninstall"; shift ;;
+    --list-schemes) ACTION="list-schemes"; shift ;;
+    -h|--help)      ACTION="help"; shift ;;
+    *)              BAD_FLAG="$1"; ACTION="help"; shift ;;
   esac
 done
 
@@ -71,13 +84,44 @@ banner() {
   echo
 }
 
+RESULTS=()   # collected "STATUS<TAB>message" lines for the end-of-run summary
+
 section() { echo; echo "${BLUE}${BOLD}==> $*${RESET}"; }
 step() { STEP=$((STEP+1)); echo "${CYAN}${BOLD}[$STEP]${RESET} ${BOLD}$*${RESET}"; }
-ok()   { echo "   ${GREEN}${BOLD}OK $*${RESET}"; }
-warn() { echo "   ${YELLOW}${BOLD}!! $*${RESET}"; }
-fail() { echo "   ${RED}${BOLD}XX $*${RESET}"; }
+ok()   { RESULTS+=( "OK"$'\t'"$*" );   echo "   ${GREEN}${BOLD}OK $*${RESET}"; }
+warn() { RESULTS+=( "SKIP"$'\t'"$*" ); echo "   ${YELLOW}${BOLD}!! $*${RESET}"; }
+fail() { RESULTS+=( "FAIL"$'\t'"$*" ); echo "   ${RED}${BOLD}XX $*${RESET}"; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ---- dry-run helpers ----
+is_dry() { [[ "$DRY_RUN" == "1" ]]; }
+would()  { echo "   ${MAGENTA}${BOLD}~>${RESET} ${DIM}[dry-run] would $*${RESET}"; RESULTS+=( "PLAN"$'\t'"$*" ); }
+
+# ---- color swatches (truecolor) for scheme previews ----
+supports_truecolor() {
+  [[ "$NO_COLOR" != "1" ]] && [[ -t 1 ]] && [[ "${COLORTERM:-}" == *truecolor* || "${COLORTERM:-}" == *24bit* ]]
+}
+hex_to_rgb() { local h="${1#\#}"; printf '%d %d %d' "0x${h:0:2}" "0x${h:2:2}" "0x${h:4:2}"; }
+swatch() {
+  # Render each hex arg as a colored block; degrade to names if no truecolor.
+  local h r g b
+  if ! supports_truecolor; then printf '%s ' "$@"; return 0; fi
+  for h in "$@"; do
+    read -r r g b <<<"$(hex_to_rgb "$h")"
+    printf '\e[48;2;%d;%d;%dm  \e[0m' "$r" "$g" "$b"
+  done
+}
+
+# ---- yes/no confirmation (auto-yes with --yes or on a non-interactive stdin) ----
+confirm() {
+  local prompt="${1:-Proceed?}" reply
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  [[ ! -t 0 ]] && return 0
+  printf "%s %s" "${YELLOW}${BOLD}${prompt}${RESET}" "${DIM}[y/N]${RESET} "
+  read -r reply
+  [[ "$reply" =~ ^[Yy] ]]
+}
 
 SPIN_FRAMES=( "|" "/" "-" "\\" )
 spinner() {
@@ -96,6 +140,11 @@ run_cmd() {
   local desc="$1"; shift
   local logfile="${LOG_DIR}/$(date +%Y%m%d-%H%M%S)-step${STEP}.log"
   step "$desc"
+
+  if is_dry; then
+    would "run: $*"
+    return 0
+  fi
 
   if [[ "$VERBOSE" == "1" ]]; then
     if "$@" 2>&1 | tee "$logfile"; then
@@ -131,18 +180,27 @@ trap on_err ERR
 
 require_sudo() {
   step "Requesting sudo permission (needed for installs)"
+  if is_dry; then would "prompt for sudo"; return 0; fi
   sudo -v
   ok "Sudo authorized"
 }
 
 # ========================= Paths =========================
 FASTFETCH_DIR="${HOME}/.config/fastfetch"
+FASTFETCH_CONF="${FASTFETCH_DIR}/config-termcraft.jsonc"
+POKE_SRC_DIR="${HOME}/.local/share/pokemon-colorscripts"
 TERMRC_DIR="${HOME}/.config/xfce4/terminal"
 TERMRC_FILE="${TERMRC_DIR}/terminalrc"
 FONT_DIR="${HOME}/.local/share/fonts/JetBrainsMonoNerd"
 OMZ_DIR="${HOME}/.oh-my-zsh"
 ZSH_CUSTOM_PLUGINS="${OMZ_DIR}/custom/plugins"
 ZSH_CUSTOM_THEMES="${OMZ_DIR}/custom/themes"
+AGNOSTER_THEME="${ZSH_CUSTOM_THEMES}/agnosterzak.zsh-theme"
+
+ZSHRC="${HOME}/.zshrc"
+ZSHRC_BACKUP="${HOME}/.zshrc.termcraft-backup"
+BLOCK_START="# >>> termcraft (managed) >>>"
+BLOCK_END="# <<< termcraft (managed) <<<"
 
 # ========================= Terminal schemes =========================
 scheme_palette() {
@@ -260,7 +318,7 @@ apt_install() {
   run_cmd "Updating apt package lists" sudo apt-get update -y
 
   local required_pkgs=(
-    git curl ca-certificates unzip xz-utils
+    git curl ca-certificates unzip xz-utils python3
     xfconf xfce4-terminal
     zsh fontconfig lsd
   )
@@ -270,6 +328,10 @@ apt_install() {
   section "Optional packages"
   for pkg in fastfetch fonts-firacode fonts-font-awesome fonts-noto fonts-noto-color-emoji; do
     step "Installing optional: ${pkg}"
+    if is_dry; then
+      would "apt-get install ${pkg} (optional)"
+      continue
+    fi
     if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1; then
       ok "Installed: ${pkg}"
     else
@@ -290,6 +352,7 @@ install_oh_my_zsh() {
 
 install_zsh_plugins() {
   section "Zsh plugins"
+  if is_dry; then would "clone zsh-autosuggestions + zsh-syntax-highlighting"; return 0; fi
   mkdir -p "$ZSH_CUSTOM_PLUGINS"
   git_clone_or_update "https://github.com/zsh-users/zsh-autosuggestions" \
     "${ZSH_CUSTOM_PLUGINS}/zsh-autosuggestions"
@@ -299,6 +362,7 @@ install_zsh_plugins() {
 
 install_agnosterzak_theme() {
   section "agnosterzak theme (Debian-Hyprland)"
+  if is_dry; then would "download agnosterzak.zsh-theme"; return 0; fi
   mkdir -p "$ZSH_CUSTOM_THEMES"
   run_cmd "Downloading agnosterzak.zsh-theme" curl -fsSL \
     "https://raw.githubusercontent.com/JaKooLit/Debian-Hyprland/main/assets/add_zsh_theme/agnosterzak.zsh-theme" \
@@ -311,6 +375,7 @@ install_jetbrains_nerd_font() {
     ok "JetBrainsMono Nerd Font already installed"
     return 0
   fi
+  if is_dry; then would "download + install JetBrainsMono Nerd Font"; return 0; fi
 
   mkdir -p "$FONT_DIR"
   local tmp; tmp="$(mktemp -d)"
@@ -323,48 +388,85 @@ install_jetbrains_nerd_font() {
 }
 
 install_fastfetch_config() {
-  section "Fastfetch compact config"
+  section "Fastfetch config (detailed, Pokemon-ready)"
+  if is_dry; then would "write detailed fastfetch config -> ${FASTFETCH_CONF}"; return 0; fi
   if ! need_cmd fastfetch; then
-    warn "fastfetch is not installed; skipping config download"
+    warn "fastfetch is not installed; skipping config"
     return 0
   fi
   mkdir -p "$FASTFETCH_DIR"
-  run_cmd "Downloading config-compact.jsonc" curl -fsSL \
-    "https://raw.githubusercontent.com/JaKooLit/Hyprland-Dots/main/config/fastfetch/config-compact.jsonc" \
-    -o "${FASTFETCH_DIR}/config-compact.jsonc"
+  # A detailed config that surfaces a lot of the machine (CPU, GPU, memory,
+  # swap, disk, packages, DE/WM, terminal, local IP, battery, locale). The
+  # logo is left as the distro default; the shell greeting overrides it with a
+  # piped Pokemon (see the ~/.zshrc block), matching the README screenshot.
+  cat > "$FASTFETCH_CONF" <<'JSONC'
+{
+  "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+  "logo": { "type": "auto", "padding": { "top": 1, "left": 2 } },
+  "display": { "separator": " -> " },
+  "modules": [
+    { "type": "title" },
+    "separator",
+    { "type": "os",        "key": "  OS" },
+    { "type": "host",      "key": "  Host" },
+    { "type": "kernel",    "key": "  Kernel" },
+    { "type": "uptime",    "key": "  Uptime" },
+    { "type": "packages",  "key": "  Packages" },
+    { "type": "shell",     "key": "  Shell" },
+    { "type": "de",        "key": "  DE" },
+    { "type": "wm",        "key": "  WM" },
+    { "type": "terminal",  "key": "  Terminal" },
+    "break",
+    { "type": "cpu",       "key": "  CPU" },
+    { "type": "gpu",       "key": "  GPU" },
+    { "type": "memory",    "key": "  Memory" },
+    { "type": "swap",      "key": "  Swap" },
+    { "type": "disk",      "key": "  Disk", "folders": "/" },
+    { "type": "localip",   "key": "  Local IP" },
+    { "type": "battery",   "key": "  Battery" },
+    { "type": "locale",    "key": "  Locale" },
+    "break",
+    { "type": "colors", "paddingLeft": 2, "symbol": "circle" }
+  ]
+}
+JSONC
+  ok "Wrote detailed fastfetch config -> $(basename "$FASTFETCH_CONF")"
 }
 
-write_zshrc() {
-  section "Writing Debian-Hyprland-style ~/.zshrc"
-  local zshrc="${HOME}/.zshrc"
-  if [[ -f "$zshrc" ]]; then
-    run_cmd "Backing up existing ~/.zshrc" bash -lc \
-      "cp -a '$zshrc' '${zshrc}.bak.$(date +%s)'"
+install_pokemon_colorscripts() {
+  [[ "$SHOW_POKEMON" != "1" ]] && return 0
+  section "Pokemon colorscripts (fastfetch sidekick)"
+  if need_cmd pokemon-colorscripts; then
+    ok "pokemon-colorscripts already installed"
+    return 0
   fi
+  if is_dry; then would "clone + install pokemon-colorscripts to /usr/local (needs sudo)"; return 0; fi
+  git_clone_or_update "https://gitlab.com/phoneybadger/pokemon-colorscripts.git" "$POKE_SRC_DIR"
+  run_cmd "Installing pokemon-colorscripts (sudo)" bash -lc \
+    "cd '$POKE_SRC_DIR' && sudo ./install.sh"
+}
 
-  cat > "$zshrc" <<'EOF'
-# Managed by terminal_modifier.sh — Debian-Hyprland style
-# If you come from bash you might have to change your $PATH.
-# export PATH=$HOME/bin:/usr/local/bin:$PATH
-
+# The zsh settings termcraft manages, wrapped in markers so we can update or
+# remove them without touching the rest of the user's ~/.zshrc.
+termcraft_zshrc_block() {
+  cat <<'EOF'
 export ZSH="$HOME/.oh-my-zsh"
-
 ZSH_THEME="agnosterzak"
-
-plugins=(
-    git
-    zsh-autosuggestions
-    zsh-syntax-highlighting
-)
-
+plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
 source $ZSH/oh-my-zsh.sh
 
-# fastfetch greeting (compact)
-if command -v fastfetch >/dev/null 2>&1 && [ -f "$HOME/.config/fastfetch/config-compact.jsonc" ]; then
-    fastfetch -c "$HOME/.config/fastfetch/config-compact.jsonc"
+# fastfetch greeting with a random Pokemon on the left (JaKooLit style)
+if command -v fastfetch >/dev/null 2>&1 && [ -f "$HOME/.config/fastfetch/config-termcraft.jsonc" ]; then
+    if command -v pokemon-colorscripts >/dev/null 2>&1; then
+        pokemon-colorscripts --no-title -s -r \
+            | fastfetch -c "$HOME/.config/fastfetch/config-termcraft.jsonc" \
+                        --logo-type file-raw --logo - --logo-padding-top 1 2>/dev/null
+    else
+        fastfetch -c "$HOME/.config/fastfetch/config-termcraft.jsonc"
+    fi
 fi
 
-# Set-up icons for files/directories in terminal using lsd
+# lsd icon aliases
 if command -v lsd >/dev/null 2>&1; then
     alias ls='lsd'
     alias l='ls -l'
@@ -373,7 +475,42 @@ if command -v lsd >/dev/null 2>&1; then
     alias lt='ls --tree'
 fi
 EOF
-  ok "Wrote ~/.zshrc (agnosterzak + plugins + fastfetch + lsd)"
+}
+
+write_zshrc() {
+  section "Managed ~/.zshrc block (agnosterzak + plugins + fastfetch + lsd)"
+  if is_dry; then
+    would "inject the termcraft block into ${ZSHRC} (one-time backup -> $(basename "$ZSHRC_BACKUP"))"
+    return 0
+  fi
+
+  local block; block="$(printf '%s\n%s\n%s\n' "$BLOCK_START" "$(termcraft_zshrc_block)" "$BLOCK_END")"
+
+  if [[ ! -f "$ZSHRC" ]]; then
+    { echo "# ~/.zshrc"; echo; printf '%s\n' "$block"; } > "$ZSHRC"
+    ok "Created ~/.zshrc with the termcraft block"
+    return 0
+  fi
+
+  # Back up the original exactly once so re-runs don't stack .bak files.
+  if [[ ! -f "$ZSHRC_BACKUP" ]]; then
+    cp -a "$ZSHRC" "$ZSHRC_BACKUP"
+    ok "Backed up existing ~/.zshrc -> $(basename "$ZSHRC_BACKUP")"
+  fi
+
+  if grep -qF "$BLOCK_START" "$ZSHRC"; then
+    # Strip the old managed block, then re-append a fresh one (idempotent).
+    local tmp; tmp="$(mktemp)"
+    awk -v s="$BLOCK_START" -v e="$BLOCK_END" '
+      $0==s {skip=1} skip==0 {print} $0==e {skip=0}
+    ' "$ZSHRC" > "$tmp"
+    { cat "$tmp"; printf '%s\n' "$block"; } > "$ZSHRC"
+    rm -f "$tmp"
+    ok "Refreshed the termcraft block in ~/.zshrc"
+  else
+    printf '\n%s\n' "$block" >> "$ZSHRC"
+    ok "Appended the termcraft block to ~/.zshrc (existing config preserved)"
+  fi
 }
 
 tweak_xfce_terminal() {
@@ -382,6 +519,7 @@ tweak_xfce_terminal() {
     warn "xfce4-terminal not found; skipping"
     return 0
   fi
+  if is_dry; then would "apply ${SCHEME} palette + transparency + JetBrainsMono NF to xfce4-terminal"; return 0; fi
 
   if [[ "$SCHEME" != "none" ]]; then
     if need_cmd xfconf-query && xfconf-query -c xfce4-terminal -l >/dev/null 2>&1; then
@@ -425,6 +563,7 @@ set_default_shell_zsh() {
     warn "zsh not found; cannot chsh"
     return 0
   fi
+  if is_dry; then would "chsh -s $(command -v zsh)"; return 0; fi
   step "Changing default shell to zsh"
   if chsh -s "$(command -v zsh)"; then
     ok "Default shell changed to zsh (re-login to take effect)"
@@ -433,11 +572,163 @@ set_default_shell_zsh() {
   fi
 }
 
+# ========================= Help / schemes / plan / summary =========================
+show_help() {
+  cat <<EOF
+${BOLD}termcraft${RESET} - forge a Debian-Hyprland-style terminal
+(zsh + agnosterzak + JetBrainsMono NF + fastfetch with a Pokemon sidekick)
+
+${BOLD}Usage:${RESET} ./terminal_modifier.sh [OPTIONS]
+
+${BOLD}Options:${RESET}
+  --scheme NAME     Color scheme: tokyonight (default), catppuccin, dracula, gruvbox, none
+  --chsh            Also set zsh as your default shell
+  --no-pokemon      Skip the Pokemon greeting (fastfetch only)
+  --dry-run, -n     Show what would happen without changing anything
+  --yes, -y         Don't ask for confirmation
+  --list-schemes    Preview the available color schemes and exit
+  --uninstall       Undo termcraft (restore ~/.zshrc, reset xfce4-terminal)
+  --verbose         Stream command output instead of a spinner
+  --no-spinner      Disable the spinner animation
+  --no-color        Disable colored output
+  -h, --help        Show this help and exit
+
+${BOLD}Environment equivalents:${RESET}
+  ARCHNEXUS_CHSH=1  ARCHNEXUS_NO_POKEMON=1  ARCHNEXUS_DRY_RUN=1  ARCHNEXUS_YES=1
+  ARCHNEXUS_VERBOSE=1  ARCHNEXUS_NO_SPINNER=1  ARCHNEXUS_NO_COLOR=1
+EOF
+}
+
+do_list_schemes() {
+  echo "${BOLD}Available color schemes${RESET}"
+  echo
+  local s
+  for s in tokyonight catppuccin dracula gruvbox; do
+    scheme_palette "$s"
+    printf "  ${BOLD}%-12s${RESET} " "$s"
+    swatch "${PALETTE[@]}"
+    echo
+  done
+  printf "  ${BOLD}%-12s${RESET} ${DIM}(leave terminal colors untouched)${RESET}\n" "none"
+  echo
+  echo "${DIM}Apply one with:${RESET} --scheme <name>"
+}
+
+print_plan() {
+  local poke chsh
+  poke="$([[ "$SHOW_POKEMON" == "1" ]] && echo on || echo off)"
+  chsh="$([[ "$SET_DEFAULT_SHELL" == "1" ]] && echo yes || echo no)"
+  echo "${BOLD}Plan${RESET} ${DIM}(scheme: ${SCHEME} | pokemon: ${poke} | set default shell: ${chsh})${RESET}"
+  if [[ "$SCHEME" != "none" ]]; then
+    scheme_palette "$SCHEME"
+    printf "  ${DIM}palette:${RESET} "; swatch "${PALETTE[@]}"; echo
+  fi
+  echo "  ${CYAN}1.${RESET} apt: zsh, xfce4-terminal, lsd, fontconfig, xz-utils, python3, fonts, ..."
+  echo "  ${CYAN}2.${RESET} Oh My Zsh + zsh-autosuggestions + zsh-syntax-highlighting"
+  echo "  ${CYAN}3.${RESET} agnosterzak theme + JetBrainsMono Nerd Font"
+  echo "  ${CYAN}4.${RESET} detailed fastfetch config$([[ "$SHOW_POKEMON" == "1" ]] && echo " + pokemon-colorscripts")"
+  echo "  ${CYAN}5.${RESET} managed ~/.zshrc block (existing config preserved)"
+  echo "  ${CYAN}6.${RESET} xfce4-terminal: ${SCHEME} palette + transparency + JetBrainsMono NF"
+  [[ "$SET_DEFAULT_SHELL" == "1" ]] && echo "  ${CYAN}7.${RESET} set zsh as the default shell (chsh)"
+}
+
+notify_running_terminal() {
+  if pgrep -x xfce4-terminal >/dev/null 2>&1; then
+    warn "xfce4-terminal is running - close all its windows (or log out/in) for the new colors/font to apply."
+  fi
+}
+
+print_summary() {
+  local okc=0 skipc=0 failc=0 planc=0 line status msg
+  for line in "${RESULTS[@]}"; do
+    status="${line%%$'\t'*}"
+    case "$status" in OK) okc=$((okc+1));; SKIP) skipc=$((skipc+1));; FAIL) failc=$((failc+1));; PLAN) planc=$((planc+1));; esac
+  done
+  echo
+  echo "${BOLD}Summary:${RESET} ${GREEN}${okc} ok${RESET}, ${YELLOW}${skipc} skipped${RESET}, ${RED}${failc} failed${RESET}$([[ $planc -gt 0 ]] && printf ', %s%s planned%s' "$MAGENTA" "$planc" "$RESET")"
+  for line in "${RESULTS[@]}"; do
+    status="${line%%$'\t'*}"; msg="${line#*$'\t'}"
+    case "$status" in
+      SKIP) printf "  ${YELLOW}. skipped:${RESET} %s\n" "$msg" ;;
+      FAIL) printf "  ${RED}x failed:${RESET} %s\n" "$msg" ;;
+    esac
+  done
+}
+
+do_uninstall() {
+  banner
+  section "Uninstall termcraft"
+  if ! confirm "Remove termcraft's changes (restore ~/.zshrc, reset xfce4-terminal colors)?"; then
+    warn "Uninstall cancelled"; return 0
+  fi
+
+  # 1) ~/.zshrc: restore the backup if we made one, else strip the managed block.
+  if [[ -f "$ZSHRC_BACKUP" ]]; then
+    if is_dry; then would "restore ${ZSHRC} from $(basename "$ZSHRC_BACKUP")"
+    else cp -a "$ZSHRC_BACKUP" "$ZSHRC" && ok "Restored ~/.zshrc from backup"; fi
+  elif [[ -f "$ZSHRC" ]] && grep -qF "$BLOCK_START" "$ZSHRC"; then
+    if is_dry; then would "strip termcraft block from ${ZSHRC}"
+    else
+      local tmp; tmp="$(mktemp)"
+      awk -v s="$BLOCK_START" -v e="$BLOCK_END" '$0==s{skip=1} skip==0{print} $0==e{skip=0}' "$ZSHRC" > "$tmp"
+      mv "$tmp" "$ZSHRC"; ok "Removed termcraft block from ~/.zshrc"
+    fi
+  else
+    warn "No termcraft ~/.zshrc changes found"
+  fi
+
+  # 2) files termcraft created
+  local f
+  for f in "$FASTFETCH_CONF" "$AGNOSTER_THEME"; do
+    [[ -f "$f" ]] || continue
+    if is_dry; then would "remove $f"; else rm -f "$f" && ok "Removed $(basename "$f")"; fi
+  done
+
+  # 3) reset the xfce4-terminal properties termcraft set
+  if need_cmd xfconf-query; then
+    local props=(/color-use-theme /color-use-system /color-background /color-foreground
+                 /color-cursor /color-palette /background-mode /background-darkness
+                 /font-use-system /font-name)
+    if is_dry; then would "reset xfconf props: ${props[*]}"
+    else
+      local p
+      for p in "${props[@]}"; do xfconf-query -c xfce4-terminal -p "$p" -r >/dev/null 2>&1 || true; done
+      ok "Reset xfce4-terminal colors/font (xfconf)"
+    fi
+  fi
+
+  echo
+  echo "${DIM}Left in place (remove manually if you want):${RESET} Oh My Zsh, zsh plugins,"
+  echo "${DIM}JetBrainsMono NF, pokemon-colorscripts, and installed apt packages.${RESET}"
+  notify_running_terminal
+}
+
+# ========================= Entry point =========================
 main() {
+  case "$ACTION" in
+    help)
+      banner
+      [[ -n "$BAD_FLAG" ]] && fail "Unknown option: ${BAD_FLAG}"
+      show_help
+      [[ -n "$BAD_FLAG" ]] && exit 2
+      exit 0
+      ;;
+    list-schemes) banner; do_list_schemes; exit 0 ;;
+    uninstall)    do_uninstall; exit 0 ;;
+  esac
+
   banner
 
   [[ "${EUID}" -eq 0 ]] && { fail "Run this as your normal user (not root)."; exit 1; }
   need_cmd apt-get || { fail "This script targets Debian/Ubuntu (apt-get not found)."; exit 1; }
+
+  print_plan
+  echo
+  if is_dry; then
+    echo "${MAGENTA}${BOLD}Dry run - no changes will be made.${RESET}"
+  else
+    confirm "Proceed with these changes?" || { warn "Cancelled by user."; exit 0; }
+  fi
 
   section "System checks"
   ok "User: ${BOLD}${USER}${RESET}"
@@ -449,6 +740,7 @@ main() {
   install_agnosterzak_theme
   install_jetbrains_nerd_font
   install_fastfetch_config
+  install_pokemon_colorscripts
   write_zshrc
   tweak_xfce_terminal
   set_default_shell_zsh
@@ -458,13 +750,19 @@ main() {
   end_ts="$(date +%s)"
   elapsed="$((end_ts - START_TS))"
 
-  echo "${GREEN}${BOLD}Done. Open a NEW terminal window to see the new look.${RESET}"
+  print_summary
   echo
-  echo "${CYAN}${BOLD}Notes:${RESET}"
-  echo "  * If colors look wrong in xfce4-terminal, log out/in once (xfconf cache)."
-  echo "  * If the prompt glyphs render as boxes, set the terminal font to"
-  echo "    ${BOLD}JetBrainsMono Nerd Font${RESET} explicitly."
-  echo "  * Run with ${BOLD}--chsh${RESET} (or ARCHNEXUS_CHSH=1) to also make zsh your default shell."
+  if is_dry; then
+    echo "${MAGENTA}${BOLD}Dry run complete.${RESET} Re-run without --dry-run to apply."
+  else
+    echo "${GREEN}${BOLD}Done. Open a NEW terminal window to see the new look.${RESET}"
+    echo "${CYAN}${BOLD}Notes:${RESET}"
+    echo "  * If the prompt glyphs render as boxes, set the terminal font to"
+    echo "    ${BOLD}JetBrainsMono Nerd Font${RESET} explicitly."
+    echo "  * Run with ${BOLD}--chsh${RESET} to also make zsh your default shell."
+    echo "  * Undo everything with ${BOLD}--uninstall${RESET}."
+    notify_running_terminal
+  fi
   echo
   echo "${DIM}Elapsed:${RESET} ${BOLD}${elapsed}s${RESET}"
   echo
